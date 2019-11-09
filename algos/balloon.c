@@ -19,7 +19,7 @@
 
 #include <stdlib.h>
 #include <string.h>
-#include <openssl/sha.h>
+#include <algos/sha256.h>
 #include <algos/balloon.h>
 
 typedef struct {
