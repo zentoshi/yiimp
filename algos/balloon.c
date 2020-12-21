@@ -16,278 +16,269 @@
  * OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR
  * PERFORMANCE OF THIS SOFTWARE.
  */
-
+#include <algos/balloon.h>
+#include <inttypes.h>
+#include <openssl/evp.h>
+#include <openssl/sha.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
-#include <algos/sha256.h>
-#include <algos/balloon.h>
 
-typedef struct {
-	aes_key ks;
-	block128_f block;
-} evp_aes_key;
+#define BUFLEN (1 << 18)
+#define EXPROUNDS (BUFLEN / 32)
+#define BLOCKSIZE (8 * sizeof(uint32_t))
 
-struct balloon_evp_cipher_st;
-struct balloon_evp_cipher_ctx_st;
-typedef struct balloon_evp_cipher_st balloon_evp_cipher;
-typedef struct balloon_evp_cipher_ctx_st balloon_evp_cipher_ctx;
+#ifdef __AES__
 
-struct balloon_evp_cipher_st {
-	int nid;
-	int block_size;
-	int key_len;
-	int iv_len;
-	unsigned long flags;
-	int (*init)(balloon_evp_cipher_ctx* ctx, const unsigned char* key, const unsigned char* iv, int enc);
-	int (*do_cipher)(balloon_evp_cipher_ctx* ctx, unsigned char* out, const unsigned char* in, size_t inl);
-	int (*cleanup)(balloon_evp_cipher_ctx*);
-	int ctx_size;
-	int (*ctrl)(balloon_evp_cipher_ctx*, int type, int arg, void* ptr);
-	void* app_data;
-};
+#ifdef __SSE4_2__
+#include <smmintrin.h>
+#endif
+#include <tmmintrin.h> //SSE3
+#include <wmmintrin.h> //AES-NI
 
-struct balloon_evp_cipher_ctx_st {
-	const balloon_evp_cipher* cipher;
-	int encrypt;
-	int buf_len;
-	unsigned char oiv[16];
-	unsigned char iv[16];
-	unsigned char buf[32];
-	int num;
-	void* app_data;
-	int key_len;
-	unsigned long flags;
-	void* cipher_data;
-	int final_used;
-	int block_mask;
-	unsigned char final[32];
-};
+#define bswap32(x) ((((x) << 24) & 0xff000000u) | (((x) << 8) & 0x00ff0000u) | (((x) >> 8) & 0x0000ff00u) | (((x) >> 24) & 0x000000ffu))
 
-struct bitstream {
-	uint8_t* zeros;
-	balloon_evp_cipher_ctx ctx;
-};
-
-struct hash_state {
-	uint64_t counter;
-	uint8_t* buffer;
-	struct bitstream bstream;
-};
-
-static void aes_encrypt(const unsigned char* in, unsigned char* out, const aes_key* key)
+static __m128i aes_128_key_exp(__m128i key, const int rcon)
 {
-	const uint32_t* rk;
-	uint32_t s0, s1, s2, s3, t0, t1, t2, t3;
-	rk = key->rd_key;
-	s0 = GETU32(in) ^ rk[0];
-	s1 = GETU32(in + 4) ^ rk[1];
-	s2 = GETU32(in + 8) ^ rk[2];
-	s3 = GETU32(in + 12) ^ rk[3];
-	t0 = te0[s0 >> 24] ^ te1[(s1 >> 16) & 0xff] ^ te2[(s2 >> 8) & 0xff] ^ te3[s3 & 0xff] ^ rk[4];
-	t1 = te0[s1 >> 24] ^ te1[(s2 >> 16) & 0xff] ^ te2[(s3 >> 8) & 0xff] ^ te3[s0 & 0xff] ^ rk[5];
-	t2 = te0[s2 >> 24] ^ te1[(s3 >> 16) & 0xff] ^ te2[(s0 >> 8) & 0xff] ^ te3[s1 & 0xff] ^ rk[6];
-	t3 = te0[s3 >> 24] ^ te1[(s0 >> 16) & 0xff] ^ te2[(s1 >> 8) & 0xff] ^ te3[s2 & 0xff] ^ rk[7];
-	s0 = te0[t0 >> 24] ^ te1[(t1 >> 16) & 0xff] ^ te2[(t2 >> 8) & 0xff] ^ te3[t3 & 0xff] ^ rk[8];
-	s1 = te0[t1 >> 24] ^ te1[(t2 >> 16) & 0xff] ^ te2[(t3 >> 8) & 0xff] ^ te3[t0 & 0xff] ^ rk[9];
-	s2 = te0[t2 >> 24] ^ te1[(t3 >> 16) & 0xff] ^ te2[(t0 >> 8) & 0xff] ^ te3[t1 & 0xff] ^ rk[10];
-	s3 = te0[t3 >> 24] ^ te1[(t0 >> 16) & 0xff] ^ te2[(t1 >> 8) & 0xff] ^ te3[t2 & 0xff] ^ rk[11];
-	t0 = te0[s0 >> 24] ^ te1[(s1 >> 16) & 0xff] ^ te2[(s2 >> 8) & 0xff] ^ te3[s3 & 0xff] ^ rk[12];
-	t1 = te0[s1 >> 24] ^ te1[(s2 >> 16) & 0xff] ^ te2[(s3 >> 8) & 0xff] ^ te3[s0 & 0xff] ^ rk[13];
-	t2 = te0[s2 >> 24] ^ te1[(s3 >> 16) & 0xff] ^ te2[(s0 >> 8) & 0xff] ^ te3[s1 & 0xff] ^ rk[14];
-	t3 = te0[s3 >> 24] ^ te1[(s0 >> 16) & 0xff] ^ te2[(s1 >> 8) & 0xff] ^ te3[s2 & 0xff] ^ rk[15];
-	s0 = te0[t0 >> 24] ^ te1[(t1 >> 16) & 0xff] ^ te2[(t2 >> 8) & 0xff] ^ te3[t3 & 0xff] ^ rk[16];
-	s1 = te0[t1 >> 24] ^ te1[(t2 >> 16) & 0xff] ^ te2[(t3 >> 8) & 0xff] ^ te3[t0 & 0xff] ^ rk[17];
-	s2 = te0[t2 >> 24] ^ te1[(t3 >> 16) & 0xff] ^ te2[(t0 >> 8) & 0xff] ^ te3[t1 & 0xff] ^ rk[18];
-	s3 = te0[t3 >> 24] ^ te1[(t0 >> 16) & 0xff] ^ te2[(t1 >> 8) & 0xff] ^ te3[t2 & 0xff] ^ rk[19];
-	t0 = te0[s0 >> 24] ^ te1[(s1 >> 16) & 0xff] ^ te2[(s2 >> 8) & 0xff] ^ te3[s3 & 0xff] ^ rk[20];
-	t1 = te0[s1 >> 24] ^ te1[(s2 >> 16) & 0xff] ^ te2[(s3 >> 8) & 0xff] ^ te3[s0 & 0xff] ^ rk[21];
-	t2 = te0[s2 >> 24] ^ te1[(s3 >> 16) & 0xff] ^ te2[(s0 >> 8) & 0xff] ^ te3[s1 & 0xff] ^ rk[22];
-	t3 = te0[s3 >> 24] ^ te1[(s0 >> 16) & 0xff] ^ te2[(s1 >> 8) & 0xff] ^ te3[s2 & 0xff] ^ rk[23];
-	s0 = te0[t0 >> 24] ^ te1[(t1 >> 16) & 0xff] ^ te2[(t2 >> 8) & 0xff] ^ te3[t3 & 0xff] ^ rk[24];
-	s1 = te0[t1 >> 24] ^ te1[(t2 >> 16) & 0xff] ^ te2[(t3 >> 8) & 0xff] ^ te3[t0 & 0xff] ^ rk[25];
-	s2 = te0[t2 >> 24] ^ te1[(t3 >> 16) & 0xff] ^ te2[(t0 >> 8) & 0xff] ^ te3[t1 & 0xff] ^ rk[26];
-	s3 = te0[t3 >> 24] ^ te1[(t0 >> 16) & 0xff] ^ te2[(t1 >> 8) & 0xff] ^ te3[t2 & 0xff] ^ rk[27];
-	t0 = te0[s0 >> 24] ^ te1[(s1 >> 16) & 0xff] ^ te2[(s2 >> 8) & 0xff] ^ te3[s3 & 0xff] ^ rk[28];
-	t1 = te0[s1 >> 24] ^ te1[(s2 >> 16) & 0xff] ^ te2[(s3 >> 8) & 0xff] ^ te3[s0 & 0xff] ^ rk[29];
-	t2 = te0[s2 >> 24] ^ te1[(s3 >> 16) & 0xff] ^ te2[(s0 >> 8) & 0xff] ^ te3[s1 & 0xff] ^ rk[30];
-	t3 = te0[s3 >> 24] ^ te1[(s0 >> 16) & 0xff] ^ te2[(s1 >> 8) & 0xff] ^ te3[s2 & 0xff] ^ rk[31];
-	s0 = te0[t0 >> 24] ^ te1[(t1 >> 16) & 0xff] ^ te2[(t2 >> 8) & 0xff] ^ te3[t3 & 0xff] ^ rk[32];
-	s1 = te0[t1 >> 24] ^ te1[(t2 >> 16) & 0xff] ^ te2[(t3 >> 8) & 0xff] ^ te3[t0 & 0xff] ^ rk[33];
-	s2 = te0[t2 >> 24] ^ te1[(t3 >> 16) & 0xff] ^ te2[(t0 >> 8) & 0xff] ^ te3[t1 & 0xff] ^ rk[34];
-	s3 = te0[t3 >> 24] ^ te1[(t0 >> 16) & 0xff] ^ te2[(t1 >> 8) & 0xff] ^ te3[t2 & 0xff] ^ rk[35];
-	t0 = te0[s0 >> 24] ^ te1[(s1 >> 16) & 0xff] ^ te2[(s2 >> 8) & 0xff] ^ te3[s3 & 0xff] ^ rk[36];
-	t1 = te0[s1 >> 24] ^ te1[(s2 >> 16) & 0xff] ^ te2[(s3 >> 8) & 0xff] ^ te3[s0 & 0xff] ^ rk[37];
-	t2 = te0[s2 >> 24] ^ te1[(s3 >> 16) & 0xff] ^ te2[(s0 >> 8) & 0xff] ^ te3[s1 & 0xff] ^ rk[38];
-	t3 = te0[s3 >> 24] ^ te1[(s0 >> 16) & 0xff] ^ te2[(s1 >> 8) & 0xff] ^ te3[s2 & 0xff] ^ rk[39];
-	rk += key->rounds << 2;
-	s0 = (te2[(t0 >> 24)] & 0xff000000) ^ (te3[(t1 >> 16) & 0xff] & 0x00ff0000) ^ (te0[(t2 >> 8) & 0xff] & 0x0000ff00) ^ (te1[(t3)&0xff] & 0x000000ff) ^ rk[0];
-	PUTU32(out, s0);
-	s1 = (te2[(t1 >> 24)] & 0xff000000) ^ (te3[(t2 >> 16) & 0xff] & 0x00ff0000) ^ (te0[(t3 >> 8) & 0xff] & 0x0000ff00) ^ (te1[(t0)&0xff] & 0x000000ff) ^ rk[1];
-	PUTU32(out + 4, s1);
-	s2 = (te2[(t2 >> 24)] & 0xff000000) ^ (te3[(t3 >> 16) & 0xff] & 0x00ff0000) ^ (te0[(t0 >> 8) & 0xff] & 0x0000ff00) ^ (te1[(t1)&0xff] & 0x000000ff) ^ rk[2];
-	PUTU32(out + 8, s2);
-	s3 = (te2[(t3 >> 24)] & 0xff000000) ^ (te3[(t0 >> 16) & 0xff] & 0x00ff0000) ^ (te0[(t1 >> 8) & 0xff] & 0x0000ff00) ^ (te1[(t2)&0xff] & 0x000000ff) ^ rk[3];
-	PUTU32(out + 12, s3);
+    __m128i key2, keygn;
+
+    key2 = _mm_aeskeygenassist_si128(key, rcon);
+    keygn = _mm_shuffle_epi32(key2, _MM_SHUFFLE(3, 3, 3, 3));
+    key2 = _mm_xor_si128(key, _mm_slli_si128(key, 4));
+    key2 = _mm_xor_si128(key2, _mm_slli_si128(key2, 4));
+    key2 = _mm_xor_si128(key2, _mm_slli_si128(key2, 4));
+    key2 = _mm_xor_si128(key2, keygn);
+
+    return key2;
 }
 
-static int aes_set_encrypt_key(const unsigned char* userKey, const int bits, aes_key* key)
+static void alx_key_expansion(__m128i* key, const uint32_t* key_bytes)
 {
-	uint32_t* rk;
-	int i = 0;
-	uint32_t temp;
-	rk = key->rd_key;
-	key->rounds = 10;
-	rk[0] = GETU32(userKey);
-	rk[1] = GETU32(userKey + 4);
-	rk[2] = GETU32(userKey + 8);
-	rk[3] = GETU32(userKey + 12);
-	while (1) {
-		temp = rk[3];
-		rk[4] = rk[0] ^ (te2[(temp >> 16) & 0xff] & 0xff000000) ^ (te3[(temp >> 8) & 0xff] & 0xff0000) ^ (te0[(temp)&0xff] & 0xff00) ^ (te1[(temp >> 24)] & 0xff) ^ rcon[i];
-		rk[5] = rk[1] ^ rk[4];
-		rk[6] = rk[2] ^ rk[5];
-		rk[7] = rk[3] ^ rk[6];
-		if (++i == 10)
-			return 0;
-		rk += 4;
-	}
+    key[0] = _mm_loadu_si128((const __m128i*)key_bytes);
+    key[1] = aes_128_key_exp(key[0], 0x01);
+    key[2] = aes_128_key_exp(key[1], 0x02);
+    key[3] = aes_128_key_exp(key[2], 0x04);
+    key[4] = aes_128_key_exp(key[3], 0x08);
+    key[5] = aes_128_key_exp(key[4], 0x10);
+    key[6] = aes_128_key_exp(key[5], 0x20);
+    key[7] = aes_128_key_exp(key[6], 0x40);
+    key[8] = aes_128_key_exp(key[7], 0x80);
+    key[9] = aes_128_key_exp(key[8], 0x1B);
+    key[10] = aes_128_key_exp(key[9], 0x36);
 }
 
-static void aes_init_key(balloon_evp_cipher_ctx* ctx, const unsigned char* key)
+static void alx_aes_encrypt(uint32_t* const iv, uint64_t* out, const __m128i* key)
 {
-	evp_aes_key* dat = (evp_aes_key*)ctx->cipher_data;
-	aes_set_encrypt_key(key, ctx->key_len * 8, &dat->ks);
-	dat->block = (block128_f)aes_encrypt;
+    const __m128i andval = _mm_set_epi64x(EXPROUNDS - 1, EXPROUNDS - 1);
+
+    __m128i m[3];
+
+    m[0] = _mm_set_epi32(iv[3], 0, 0, 0);
+    iv[3] = bswap32(bswap32(iv[3]) + 1);
+
+    m[1] = _mm_set_epi32(iv[3], 0, 0, 0);
+    iv[3] = bswap32(bswap32(iv[3]) + 1);
+
+    m[2] = _mm_set_epi32(iv[3], 0, 0, 0);
+    iv[3] = bswap32(bswap32(iv[3]) + 1);
+
+    m[0] = _mm_xor_si128(m[0], key[0]);
+    m[1] = _mm_xor_si128(m[1], key[0]);
+    m[2] = _mm_xor_si128(m[2], key[0]);
+
+    m[0] = _mm_aesenc_si128(m[0], key[1]);
+    m[1] = _mm_aesenc_si128(m[1], key[1]);
+    m[2] = _mm_aesenc_si128(m[2], key[1]);
+
+    m[0] = _mm_aesenc_si128(m[0], key[2]);
+    m[1] = _mm_aesenc_si128(m[1], key[2]);
+    m[2] = _mm_aesenc_si128(m[2], key[2]);
+
+    m[0] = _mm_aesenc_si128(m[0], key[3]);
+    m[1] = _mm_aesenc_si128(m[1], key[3]);
+    m[2] = _mm_aesenc_si128(m[2], key[3]);
+
+    m[0] = _mm_aesenc_si128(m[0], key[4]);
+    m[1] = _mm_aesenc_si128(m[1], key[4]);
+    m[2] = _mm_aesenc_si128(m[2], key[4]);
+
+    m[0] = _mm_aesenc_si128(m[0], key[5]);
+    m[1] = _mm_aesenc_si128(m[1], key[5]);
+    m[2] = _mm_aesenc_si128(m[2], key[5]);
+
+    m[0] = _mm_aesenc_si128(m[0], key[6]);
+    m[1] = _mm_aesenc_si128(m[1], key[6]);
+    m[2] = _mm_aesenc_si128(m[2], key[6]);
+
+    m[0] = _mm_aesenc_si128(m[0], key[7]);
+    m[1] = _mm_aesenc_si128(m[1], key[7]);
+    m[2] = _mm_aesenc_si128(m[2], key[7]);
+
+    m[0] = _mm_aesenc_si128(m[0], key[8]);
+    m[1] = _mm_aesenc_si128(m[1], key[8]);
+    m[2] = _mm_aesenc_si128(m[2], key[8]);
+
+    m[0] = _mm_aesenc_si128(m[0], key[9]);
+    m[1] = _mm_aesenc_si128(m[1], key[9]);
+    m[2] = _mm_aesenc_si128(m[2], key[9]);
+
+    m[0] = _mm_aesenclast_si128(m[0], key[10]);
+    m[1] = _mm_aesenclast_si128(m[1], key[10]);
+    m[2] = _mm_aesenclast_si128(m[2], key[10]);
+
+    m[0] = _mm_and_si128(m[0], andval);
+    m[1] = _mm_and_si128(m[1], andval);
+    m[2] = _mm_and_si128(m[2], andval);
+
+    m[0] = _mm_slli_epi64(m[0], 3);
+    m[1] = _mm_slli_epi64(m[1], 3);
+    m[2] = _mm_slli_epi64(m[2], 3);
+
+    _mm_storeu_si128((__m128i*)out + 0, m[0]);
+    _mm_storeu_si128((__m128i*)out + 1, m[1]);
+    _mm_storeu_si128((__m128i*)out + 2, m[2]);
+}
+#endif
+
+static void sha256(const void* input, void* output, int len)
+{
+    SHA256_CTX ctx;
+    SHA256_Init(&ctx);
+    SHA256_Update(&ctx, input, len);
+    SHA256_Final((unsigned char*)output, &ctx);
 }
 
-static void ctr128_inc(unsigned char* counter)
+static __thread uint32_t* buffer = nullptr;
+
+#ifndef __AES__
+static __thread EVP_CIPHER_CTX* aes_ctx;
+#endif
+
+static __thread uint8_t init = 0;
+
+int alx_init_balloon_buffer()
 {
-	uint32_t n = 16;
-	uint8_t c;
-	do {
-		--n;
-		c = counter[n];
-		++c;
-		counter[n] = c;
-		if (c)
-			return;
-	} while (n);
+    buffer = (uint32_t*)malloc(BUFLEN);
+    if (buffer == NULL) {
+        return -1;
+    }
+#ifndef __AES__
+    aes_ctx = EVP_CIPHER_CTX_new();
+#endif
+
+    return 0;
 }
 
-static void aes_ctr128_encrypt(const unsigned char* in, unsigned char* out, size_t len, const void* key, unsigned char ivec[16], unsigned char ecount_buf[16], unsigned int* num, block128_f block)
+void balloon(const void* input, void* output, unsigned int len)
 {
-	unsigned int n;
-	n = *num;
-	while (1) {
-		while (n && len) {
-			*(out++) = *(in++) ^ ecount_buf[n];
-			--len;
-			n = (n + 1) % 16;
-		}
-		if (len) {
-			(*block)(ivec, ecount_buf, key);
-			ctr128_inc(ivec);
-			while (len--) {
-				out[n] = in[n] ^ ecount_buf[n];
-				++n;
-			}
-		}
-		*num = n;
-		return;
-	}
+    if (!init) {
+        alx_init_balloon_buffer();
+        init = 1;
+    }
+
+    uint32_t iv[4] = { 0 };
+    uint32_t* in32 = (uint32_t*)input;
+    uint32_t* prev_block = buffer;
+    uint32_t* cur_block = buffer + 8;
+    uint32_t* nbr_block;
+    uint32_t counter = 0;
+    uint32_t hashmix[42] = { 0 };
+    uint32_t key_bytes[8] = { 0 };
+
+    /* compute AES key */
+    for (int i = 0; i < 8; i++) {
+        hashmix[i] = in32[12 + i];
+    }
+
+    hashmix[8] = 0x00000080;
+    hashmix[9] = 0;
+    hashmix[10] = 0x00000004;
+
+    sha256(hashmix, key_bytes, 11 * sizeof(uint32_t));
+
+    /* Initialize AES cipher */
+#if __AES__
+    __m128i key[11];
+    alx_key_expansion(key, key_bytes);
+#else
+    EVP_EncryptInit(aes_ctx, EVP_aes_128_ctr(), (const unsigned char*)key_bytes, (const unsigned char*)iv);
+#endif
+
+    /* Append first block from input */
+    hashmix[0] = 0;
+    hashmix[1] = 0;
+    for (int i = 0; i < 28; i++) {
+        hashmix[2 + i] = in32[(12 + i) % 20];
+    }
+    hashmix[30] = 0x00000080;
+    hashmix[31] = 0;
+    hashmix[32] = 0x00000004;
+    sha256(hashmix, buffer, 33 * sizeof(uint32_t));
+    counter++;
+
+    /* Append rest of the blocks from previous blocks */
+    for (int i = 1; i < EXPROUNDS; i++) {
+        hashmix[0] = counter;
+        hashmix[1] = 0;
+        memcpy(&hashmix[2], prev_block, BLOCKSIZE);
+        sha256(hashmix, cur_block, 40);
+        counter++;
+        prev_block = cur_block;
+        cur_block += 8;
+    }
+
+    /* Mixing rounds */
+    uint64_t buf[6] = { 0 };
+    for (int offset = 0; offset < 2; offset++) {
+        for (int i = offset; i < EXPROUNDS; i += 4) {
+            cur_block = buffer + (8 * i);
+            prev_block = i ? cur_block - 8 : buffer + ((BUFLEN / 4) - 8);
+            hashmix[0] = counter;
+            memcpy(&hashmix[2], prev_block, BLOCKSIZE);
+            memcpy(&hashmix[10], cur_block, BLOCKSIZE);
+#if __AES__
+            alx_aes_encrypt(iv, buf, key);
+#else
+            int templ;
+            EVP_EncryptUpdate(aes_ctx, (unsigned char*)&buf[0], &templ, (const unsigned char*)&iv, 16);
+            EVP_EncryptUpdate(aes_ctx, (unsigned char*)&buf[2], &templ, (const unsigned char*)&iv, 16);
+            EVP_EncryptUpdate(aes_ctx, (unsigned char*)&buf[4], &templ, (const unsigned char*)&iv, 16);
+            for (int l = 0; l < 6; l++) {
+                buf[l] = 8 * (buf[l] & (EXPROUNDS - 1));
+            }
+#endif
+            nbr_block = buffer + buf[0];
+            memcpy(&hashmix[18], nbr_block, BLOCKSIZE);
+            nbr_block = buffer + buf[1];
+            memcpy(&hashmix[26], nbr_block, BLOCKSIZE);
+            nbr_block = buffer + buf[2];
+            memcpy(&hashmix[34], nbr_block, BLOCKSIZE);
+            sha256(hashmix, cur_block, 42 * sizeof(uint32_t));
+            counter += 1;
+            cur_block = buffer + (8 * (i + 2));
+            prev_block = (i + 2) ? cur_block - 8 : buffer + ((BUFLEN / 4) - 8);
+            hashmix[0] = counter;
+            memcpy(&hashmix[2], prev_block, BLOCKSIZE);
+            memcpy(&hashmix[10], cur_block, BLOCKSIZE);
+            nbr_block = buffer + buf[3];
+            memcpy(&hashmix[18], nbr_block, BLOCKSIZE);
+            nbr_block = buffer + buf[4];
+            memcpy(&hashmix[26], nbr_block, BLOCKSIZE);
+            nbr_block = buffer + buf[5];
+            memcpy(&hashmix[34], nbr_block, BLOCKSIZE);
+            sha256(hashmix, cur_block, 42 * sizeof(uint32_t));
+            counter += 1;
+        }
+    }
+
+    /* Append last block on output */
+    memcpy((char*)output, buffer + ((BUFLEN / 4) - 8), BLOCKSIZE);
 }
 
-static int aes_ctr_cipher(balloon_evp_cipher_ctx* ctx, unsigned char* out, const unsigned char* in, size_t len)
+void alx_free_balloon_buffer()
 {
-	unsigned int num = ctx->num;
-	evp_aes_key* dat = (evp_aes_key*)ctx->cipher_data;
-	aes_ctr128_encrypt(in, out, len, &dat->ks, ctx->iv, ctx->buf, &num, dat->block);
-	ctx->num = (size_t)num;
-}
-
-balloon_evp_cipher aes_128_ctr = { 904, 1, 16, 16, 0x5, aes_init_key, aes_ctr_cipher, NULL, 264, NULL, NULL };
-balloon_evp_cipher* balloon_evp_aes_128_ctr(void) { return &aes_128_ctr; }
-
-void sha256(const void* input, void* output, int len)
-{
-        SHA256_CTX c;
-        SHA256_Init(&c);
-        SHA256_Update(&c, input, len);
-        SHA256_Final(output, &c);
-}
-
-void balloon_hash(const void* input, void* output, const int buflen)
-{
-	const int exprounds = buflen / 32;
-	struct hash_state s;
-	s.counter = 0;
-	s.buffer = (uint8_t*)malloc(buflen);
-	s.bstream.zeros = (uint8_t*)malloc(512);
-	memset(s.bstream.zeros, 0, 512);
-	uint8_t iv[16] = {0};
-	uint8_t buf[8] = {0};
-	uint8_t hashmix[168] = {0};
-	uint8_t key_bytes[32] = {0};
-	uint8_t blkpadding[12] = {0};
-	memset(blkpadding, 0x80, 1);
-	memset(blkpadding+8, 0x04, 1);
-	memset(&s.bstream.ctx, 0, 160);
-	memcpy(&hashmix[0], input+48, 32);
-	memcpy(&hashmix[32], blkpadding, 12);
-	sha256(hashmix, key_bytes, 44);
-	s.bstream.ctx.cipher = balloon_evp_aes_128_ctr();
-	s.bstream.ctx.cipher_data = malloc(264);
-	s.bstream.ctx.key_len = 16;
-	s.bstream.ctx.cipher->init(&s.bstream.ctx, (const unsigned char*)&key_bytes, (const unsigned char*)&iv, 1);
-	memcpy(&hashmix[0], &s.counter, 8);
-	memcpy(&hashmix[8], input+48, 32);
-	memcpy(&hashmix[40], input, 80);
-	memcpy(&hashmix[120], blkpadding, 12);
-	sha256(hashmix, s.buffer, 132);
-	s.counter++;
-	uint8_t* blocks[1] = { s.buffer };
-	uint8_t* cur = s.buffer + 32;
-	for (int i = 1; i < exprounds; i++) {
-		memcpy(&hashmix[0], &s.counter, 8);
-		memcpy(&hashmix[8], blocks[0], 32);
-		sha256(hashmix, cur, 40);
-		s.counter++;
-		blocks[0] += 32;
-		cur += 32;
-	}
-	uint64_t neighbor = 0;
-	for (int offset = 0; offset < 2; offset++) {
-		for (int i = offset; i < exprounds; i+=2) {
-			uint8_t* cur_block = s.buffer + (32 * i);
-			uint8_t* prev_block = i ? cur_block - 32 : s.buffer + (buflen - 32);
-			blocks[0] = prev_block;
-			blocks[1] = cur_block;
-			s.bstream.ctx.cipher->do_cipher(&s.bstream.ctx, buf, s.bstream.zeros, 8);
-			neighbor = (buf[2] << 16) | (buf[1] << 8) | buf[0];
-			blocks[2] = s.buffer + (32 * (neighbor % exprounds));
-			s.bstream.ctx.cipher->do_cipher(&s.bstream.ctx, buf, s.bstream.zeros, 8);
-			neighbor = (buf[2] << 16) | (buf[1] << 8) | buf[0];
-			blocks[3] = s.buffer + (32 * (neighbor % exprounds));
-			s.bstream.ctx.cipher->do_cipher(&s.bstream.ctx, buf, s.bstream.zeros, 8);
-			neighbor = (buf[2] << 16) | (buf[1] << 8) | buf[0];
-			blocks[4] = s.buffer + (32 * (neighbor % exprounds));
-			memcpy(&hashmix[0], &s.counter, 8);
-			memcpy(&hashmix[8], blocks[0], 32);
-			memcpy(&hashmix[40], blocks[1], 32);
-			memcpy(&hashmix[72], blocks[2], 32);
-			memcpy(&hashmix[104], blocks[3], 32);
-			memcpy(&hashmix[136], blocks[4], 32);
-			sha256(hashmix, cur_block, 168);
-			s.counter += 1;
-		}
-	}
-	memcpy((char*)output, (const char*)s.buffer + (buflen - 32), 32);
-	if (s.bstream.ctx.cipher_data) free(s.bstream.ctx.cipher_data);
-	memset(&s.bstream.ctx, 0, sizeof(balloon_evp_cipher_ctx));
-	free(s.bstream.zeros);
-	free(s.buffer);
-}
-
-void balloon(const char* input, char* output, unsigned int len) {
-	balloon_hash((void*)input, (void*)output, 262144);
+    free(buffer);
+#ifndef __AES__
+    EVP_CIPHER_CTX_free(aes_ctx);
+#endif
 }
