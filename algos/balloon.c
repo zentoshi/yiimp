@@ -169,7 +169,7 @@ int alx_init_balloon_buffer()
     return 0;
 }
 
-void balloon(const void* input, void* output, unsigned int len)
+void balloon_hash(const void* input, void* output)
 {
     if (!init) {
         alx_init_balloon_buffer();
@@ -281,4 +281,8 @@ void alx_free_balloon_buffer()
 #ifndef __AES__
     EVP_CIPHER_CTX_free(aes_ctx);
 #endif
+}
+
+void balloon(const char* input, char* output, unsigned int len) {
+	balloon_hash((void*)input, (void*)output);
 }

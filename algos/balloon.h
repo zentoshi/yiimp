@@ -22,7 +22,7 @@ extern "C" {
 #endif
 
 int alx_init_balloon_buffer();
-void balloon(const void* input, void* output, unsigned int len);
+void balloon(const char* input, char* output, unsigned int len);
 void alx_free_balloon_buffer();
 
 
